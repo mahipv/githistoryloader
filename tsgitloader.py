@@ -151,7 +151,9 @@ def multi_load(repo_url, branch="master", tool_chain="langchain,llamaindex"):
         thread.start()
     for thread in threads:
         thread.join()
-    
+    for toolchain in toolchains:
+        toolchain.create_index()
+
 def read_catalog_info(toolchain=DEFAULT_TOOL_CHAIN)->any:
     with psycopg2.connect(dsn=os.environ["TIMESCALE_SERVICE_URL"]) as connection:
         # Create a cursor within the context manager

@@ -41,6 +41,10 @@ class ToolChain:
     def insert_rows(self, rows):
         pass
 
+    @abstractmethod
+    def create_index(self):
+        pass
+
     # Helper function: get embeddings for a text
     def get_embeddings(self, text):
         response = openai.Embedding.create(
@@ -105,6 +109,9 @@ class LangChain(ToolChain):
         print(f"Inserting {len(records)} records")
         self._ts_vector_store.sync_client.upsert(records)    
 
+    def create_index(self):
+        self._ts_vector_store.create_index()
+
 class LlamaIndex(ToolChain):
     def __init__(self, table_name) -> None:
         super().__init__(table_name, "llamaindex")
@@ -150,5 +157,7 @@ class LlamaIndex(ToolChain):
             node_embedding = embedding_model.get_text_embedding(node.get_content(metadata_mode="all"))
         node.embedding = node_embedding
         _ = self._ts_vector_store.add(nodes)
+
+    def create_index(self):
         self._ts_vector_store.create_index()
     
