@@ -7,21 +7,23 @@ from datetime import datetime, timedelta
 import os
 from dotenv import load_dotenv, find_dotenv
 from langchain.vectorstores import TimescaleVector
+import pandas as pd
 from pandas import DataFrame
 from timescale_vector import client
 from llama_index.schema import TextNode
 from llama_index.embeddings import OpenAIEmbedding
+from git import Repo
 
 MAX_STR_LENGTH = 2048
 EMBEDDING_DIMENSIONS = 1536
 class ToolChain:
-
-    def __init__(self, table_name, toolchain) -> None:
+    def __init__(self, repo_dir, table_name, toolchain) -> None:
+        self._repo_dir= repo_dir
         self._table_name = table_name
         self._tool_chain = toolchain
         self._time_delta = timedelta(days=7)
         openai.api_key  = os.environ['OPENAI_API_KEY']
-        _ = load_dotenv(find_dotenv())
+        self._records = []
 
     def get_table_name(self)->str:
         return self._table_name
@@ -60,19 +62,57 @@ class ToolChain:
         uuid = client.uuid_from_time(datetime_obj)
         return str(uuid)
 
+    def process_commit_range(self, commit_count, skip_count):
+        repo = Repo(self._repo_dir)
+        # Create lists to store data
+        commit_hashes = []
+        authors = []
+        dates = []
+        subjects = []
+        bodies = []
+        # Iterate through commits and collect data
+        for commit in repo.iter_commits(max_count=commit_count, skip=skip_count):
+            commit_hash = commit.hexsha
+            author = commit.author.name
+            date = commit.committed_datetime.isoformat()
+            message_lines = commit.message.splitlines()
+            subject = message_lines[0]
+            body = "\n".join(message_lines[1:]) if len(message_lines) > 1 else ""
+
+            commit_hashes.append(commit_hash)
+            authors.append(author)
+            dates.append(date)
+            subjects.append(subject)
+            bodies.append(body)
+
+        # Create a DataFrame from the collected data
+        data = {
+            "Commit Hash": commit_hashes,
+            "Author": authors,
+            "Date": dates,
+            "Subject": subjects,
+            "Body": bodies
+        }
+        df = pd.DataFrame(data)
+        df.dropna(inplace=True)
+        df = df.astype(str)
+        df = df.applymap(lambda x: x.strip('"'))
+        #print(df.iloc[[0, -1]])
+        return(df)
+
 class LangChain(ToolChain):
-    def __init__(self, table_name) -> None:
-        super().__init__(table_name, "langchain")
-        self._ts_vector_store = TimescaleVector(
+    def __init__(self, file_name, table_name) -> None:
+        super().__init__(file_name, table_name, "langchain")
+
+    def create_tables(self):
+        ts_vector_store = TimescaleVector(
             service_url=os.environ["TIMESCALE_SERVICE_URL"],
             embedding=EMBEDDING_DIMENSIONS,
             collection_name=self._table_name,
             time_partition_interval=self._time_delta
         )
-
-    def create_tables(self):
-        self._ts_vector_store.sync_client.drop_table()
-        self._ts_vector_store.sync_client.create_tables()
+        ts_vector_store.sync_client.drop_table()
+        ts_vector_store.sync_client.create_tables()
 
     def process_row(self, row) -> any:
         max_retries = 2  # Number of times to retry
@@ -81,9 +121,7 @@ class LangChain(ToolChain):
         for _ in range(max_retries):
             try:
                 embedding = self.get_embeddings(text)    
-                # If the code block succeeds, break out of the loop
                 uuid = self.create_uuid(row['Date'])
-                # Create metadata
                 metadata = {
                     "author": row['Author'],
                     "date": row['Date'],
@@ -96,34 +134,49 @@ class LangChain(ToolChain):
                 if len(text) > MAX_STR_LENGTH:
                     text = text[:MAX_STR_LENGTH]
         else:
-            # This block is executed if the maximum number of retries is reached
             print(f"Unable to add the record {text}")
         return record
 
-    def process_frame(self, df):
-        records = []
+    def process(self, commit_count, skip_count):
+        df = self.process_commit_range(commit_count, skip_count)
+        self._records = []
         for _, row in df.iterrows():
             record = self.process_row(row)
             if record:
-                records.append(record)
-        print(f"Inserting {len(records)} records")
-        self._ts_vector_store.sync_client.upsert(records)    
+                self._records.append(record)
+
+    def save(self):
+        print(f"Inserting {len(self._records)} records")
+        ts_vector_store = TimescaleVector(
+            service_url=os.environ["TIMESCALE_SERVICE_URL"],
+            embedding=EMBEDDING_DIMENSIONS,
+            collection_name=self._table_name,
+            time_partition_interval=self._time_delta
+        )
+        ts_vector_store.sync_client.upsert(self._records)
 
     def create_index(self):
-        self._ts_vector_store.create_index()
+        ts_vector_store = TimescaleVector(
+            service_url=os.environ["TIMESCALE_SERVICE_URL"],
+            embedding=EMBEDDING_DIMENSIONS,
+            collection_name=self._table_name,
+            time_partition_interval=self._time_delta
+        )
+        ts_vector_store.create_index()
 
 class LlamaIndex(ToolChain):
-    def __init__(self, table_name) -> None:
-        super().__init__(table_name, "llamaindex")
-        self._ts_vector_store = TimescaleVectorStore.from_params(
+    def __init__(self, file_name, table_name) -> None:
+        super().__init__(file_name, table_name, "llamaindex")
+        self._nodes = []
+
+    def create_tables(self):
+        ts_vector_store = TimescaleVectorStore.from_params(
             service_url=os.environ["TIMESCALE_SERVICE_URL"],
             table_name=self._table_name,
             time_partition_interval=self._time_delta,
         )
-
-    def create_tables(self):
-        self._ts_vector_store._sync_client.drop_table()
-        self._ts_vector_store._sync_client.create_tables()
+        ts_vector_store._sync_client.drop_table()
+        ts_vector_store._sync_client.create_tables()
 
     # Create a Node object from a single row of data
     def create_node(self, row):
@@ -149,15 +202,36 @@ class LlamaIndex(ToolChain):
         )
         return node    
     
-    def process_frame(self, df):
-        nodes = [self.create_node(row) for _, row in df.iterrows()]
+    def process(self, commit_count, skip_count):
+        df = self.process_commit_range(commit_count, skip_count)
+        self._records = []
+        for _, row in df.iterrows():
+            record = self.process_row(row)
+            if record:
+                self._records.append(record)
+
+    def process(self, commit_count, skip_count):
+        df = self.process_commit_range(commit_count, skip_count)
+        self._nodes = [self.create_node(row) for _, row in df.iterrows()]
         embedding_model = OpenAIEmbedding()
         embedding_model.api_key = os.environ['OPENAI_API_KEY']
-        for node in nodes:
+        for node in self._nodes:
             node_embedding = embedding_model.get_text_embedding(node.get_content(metadata_mode="all"))
         node.embedding = node_embedding
-        _ = self._ts_vector_store.add(nodes)
+
+    def save(self):
+        print(f"Inserting {len(self._nodes)} records")
+        ts_vector_store = TimescaleVectorStore.from_params(
+            service_url=os.environ["TIMESCALE_SERVICE_URL"],
+            table_name=self._table_name,
+            time_partition_interval=self._time_delta,
+        )
+        ts_vector_store.add(self._nodes)
 
     def create_index(self):
-        self._ts_vector_store.create_index()
-    
+        ts_vector_store = TimescaleVectorStore.from_params(
+            service_url=os.environ["TIMESCALE_SERVICE_URL"],
+            table_name=self._table_name,
+            time_partition_interval=self._time_delta,
+        )
+        ts_vector_store.create_index()

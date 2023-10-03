@@ -7,8 +7,9 @@ from git import Repo
 import threading
 import pandas as pd
 from toolchainutils import LangChain, LlamaIndex
+from multiprocessing import Lock, Process
+import multiprocessing
 
-MAX_THREAD_COUNT = 6
 TSV_TM_CATALOG_TABLE_NAME = "time_machine_catalog"
 SCRATCH_REPO_DIR = "temprepo"
 DEFAULT_TOOL_CHAIN = "langchain"
@@ -44,8 +45,9 @@ def record_catalog_info(repo_url, branch, toolchain):
             table_name = github_url_to_table_name(repo_url, toolchain)
             cursor.execute(insert_data_sql, (repo_url, table_name, toolchain))
             connection.commit()
-            return table_name
-        
+    connection.close()
+    return table_name
+
 def git_clone_url(repo_url, branch, tmprepo_dir):
     # Check if the clone directory exists, and if so, remove it
     if os.path.exists(tmprepo_dir):
@@ -75,84 +77,53 @@ def git_clone_url(repo_url, branch, tmprepo_dir):
     except subprocess.CalledProcessError as e:
         print(f"Error: {e}")
 
+def tool_chain_factory(repo_dir, table_name, tool_chain):
+    tool = None
+    if (tool_chain == "langchain"):
+        tool = LangChain(repo_dir, table_name)
+    if (tool_chain == "llamaindex"):
+        tool = LlamaIndex(repo_dir, table_name)
+    return tool
 
-def process_commit_range(repo_dir, commit_count, skip_count, toolchains):
-    repo = Repo(repo_dir)
-    # Create lists to store data
-    commit_hashes = []
-    authors = []
-    dates = []
-    subjects = []
-    bodies = []
-    print(f"{threading.current_thread().name} commits:{commit_count} - skip : {skip_count}")
-    # Iterate through commits and collect data
-    for commit in repo.iter_commits(max_count=commit_count, skip=skip_count):
-        commit_hash = commit.hexsha
-        author = commit.author.name
-        date = commit.committed_datetime.isoformat()
-        message_lines = commit.message.splitlines()
-        subject = message_lines[0]
-        body = "\n".join(message_lines[1:]) if len(message_lines) > 1 else ""
+def call_tool_chain_utils(lock, repo_dir, table_name, toolchain, params):
+    toolchain_obj = tool_chain_factory(repo_dir, table_name, toolchain)
+    toolchain_obj.process(params[0], params[1])
+    with lock:
+        toolchain_obj.save()
 
-        commit_hashes.append(commit_hash)
-        authors.append(author)
-        dates.append(date)
-        subjects.append(subject)
-        bodies.append(body)
+def setup_tables(table_name, toolchain):
+    toolchain_obj = tool_chain_factory("", table_name, toolchain)
+    toolchain_obj.create_tables()
 
-    # Create a DataFrame from the collected data
-    data = {
-        "Commit Hash": commit_hashes,
-        "Author": authors,
-        "Date": dates,
-        "Subject": subjects,
-        "Body": bodies
-    }
-    df = pd.DataFrame(data)
-    df.dropna(inplace=True)
-    df = df.astype(str)
-    df = df.applymap(lambda x: x.strip('"'))
-    for toolchain in toolchains:
-        rows = toolchain.process_frame(df)
-        toolchain.insert_rows(rows)
-    #print(df.iloc[[0, -1]])
-
-def setup_tables(repourl, branch, tool_chains) -> any:
-    tool_chain_list = tool_chains.split(",")
-    toolchains = []
-    for toolchain in tool_chain_list:
-        if toolchain == "langchain":
-            toolchain_obj = LangChain(record_catalog_info(repourl, branch, toolchain))
-        if toolchain == "llamaindex":
-            toolchain_obj =LlamaIndex(record_catalog_info(repourl, branch,toolchain))
-        print(toolchain_obj.get_table_name())
-        toolchain_obj.create_tables()
-        toolchains.append(toolchain_obj)
-    return toolchains
-
-def multi_load(repo_url, branch="master", tool_chain="langchain,llamaindex"):
-    repo_dir = git_clone_url(repo_url, branch, SCRATCH_REPO_DIR)
-    #repo_dir = tsg.SCRATCH_REPO_DIR
+def insert_rows_for_tool_chain(repo_dir, table_name, toolchain):
     repo = Repo(repo_dir)
     commit_count = len(list(repo.iter_commits()))
     print(f"Commit count: {commit_count}")
-    commits_per_thread = commit_count//(MAX_THREAD_COUNT)
-    remainder = commit_count % MAX_THREAD_COUNT
-    thread_workloads = [commits_per_thread] * (MAX_THREAD_COUNT - 1) + [commits_per_thread + remainder]
-    print(thread_workloads)
+    process_count = multiprocessing.cpu_count()
+    commits_per_process = commit_count//(process_count)
+    remainder = commit_count % process_count
+    process_commit_counts = [commits_per_process] * (process_count - 1) + [commits_per_process + remainder]
+    print(process_commit_counts)
     skip = 0
-    threads = []
-    toolchains = setup_tables(repo_url, branch, tool_chain)
-    for thread_commit_count in thread_workloads:
-        name = f"Thread_skip_{skip}_{thread_commit_count}"
-        thread = threading.Thread(target=process_commit_range, name=name, args=(repo_dir, thread_commit_count, skip, toolchains))
-        skip+= thread_commit_count
-        threads.append(thread)
-        thread.start()
-    for thread in threads:
-        thread.join()
-    for toolchain in toolchains:
-        toolchain.create_index()
+    lock = Lock()
+    processes = []
+    for commit_count in process_commit_counts:
+        data = [commit_count, skip]
+        skip += commit_count
+        p = Process(target=call_tool_chain_utils, args=(lock, repo_dir, table_name, toolchain, data))
+        processes.append(p)
+        p.start()
+    for p in processes:
+        p.join()
+
+def multi_load(repo_url, branch="master", tool_chain="langchain,llamaindex"):
+    repo_dir = git_clone_url(repo_url, branch, SCRATCH_REPO_DIR)
+    #repo_dir = SCRATCH_REPO_DIR
+    tool_chain_list = tool_chain.split(",")
+    for toolchain in tool_chain_list:
+        table_name = record_catalog_info(repo_url, branch, toolchain)
+        setup_tables(table_name, toolchain)
+        insert_rows_for_tool_chain(repo_dir, table_name, toolchain)
 
 def read_catalog_info(toolchain=DEFAULT_TOOL_CHAIN)->any:
     with psycopg2.connect(dsn=os.environ["TIMESCALE_SERVICE_URL"]) as connection:
@@ -164,15 +135,13 @@ def read_catalog_info(toolchain=DEFAULT_TOOL_CHAIN)->any:
                 cursor.execute(select_data_sql)
             except psycopg2.errors.UndefinedTable as e:
                 return {}
-
             catalog_entries = cursor.fetchall()
-
             catalog_dict = {}
             for entry in catalog_entries:
                 repo_url, table_name = entry
                 catalog_dict[repo_url] = table_name
-
-            return catalog_dict
+    connection.close()
+    return catalog_dict
 
 def load_git_history(repo_url:str, branch:str, toolchain:str):
     multi_load(repo_url, branch, toolchain)
