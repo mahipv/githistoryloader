@@ -86,7 +86,8 @@ def tool_chain_factory(repo_dir, table_name, tool_chain):
     return tool
 
 def call_tool_chain_utils(lock, repo_dir, table_name, toolchain, params):
-    toolchain_obj = tool_chain_factory(repo_dir, table_name, toolchain)
+    with lock:
+        toolchain_obj = tool_chain_factory(repo_dir, table_name, toolchain)
     toolchain_obj.process(params[0], params[1])
     with lock:
         toolchain_obj.save()

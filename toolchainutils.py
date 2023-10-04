@@ -103,16 +103,18 @@ class ToolChain:
 class LangChain(ToolChain):
     def __init__(self, file_name, table_name) -> None:
         super().__init__(file_name, table_name, "langchain")
-
-    def create_tables(self):
-        ts_vector_store = TimescaleVector(
+        self._ts_vector_store = TimescaleVector(
             service_url=os.environ["TIMESCALE_SERVICE_URL"],
             embedding=EMBEDDING_DIMENSIONS,
             collection_name=self._table_name,
             time_partition_interval=self._time_delta
         )
-        ts_vector_store.sync_client.drop_table()
-        ts_vector_store.sync_client.create_tables()
+        self._records = []
+
+
+    def create_tables(self):
+        self._ts_vector_store.sync_client.drop_table()
+        self._ts_vector_store.sync_client.create_tables()
 
     def process_row(self, row) -> any:
         max_retries = 2  # Number of times to retry
@@ -146,37 +148,29 @@ class LangChain(ToolChain):
                 self._records.append(record)
 
     def save(self):
+        if (len(self._records)) < 1:
+            return
         print(f"Inserting {len(self._records)} records")
-        ts_vector_store = TimescaleVector(
-            service_url=os.environ["TIMESCALE_SERVICE_URL"],
-            embedding=EMBEDDING_DIMENSIONS,
-            collection_name=self._table_name,
-            time_partition_interval=self._time_delta
-        )
-        ts_vector_store.sync_client.upsert(self._records)
+        self._ts_vector_store.sync_client.upsert(self._records)
 
     def create_index(self):
-        ts_vector_store = TimescaleVector(
-            service_url=os.environ["TIMESCALE_SERVICE_URL"],
-            embedding=EMBEDDING_DIMENSIONS,
-            collection_name=self._table_name,
-            time_partition_interval=self._time_delta
-        )
-        ts_vector_store.create_index()
+        print("Creating Index")
+        self._ts_vector_store.create_index()
 
 class LlamaIndex(ToolChain):
     def __init__(self, file_name, table_name) -> None:
         super().__init__(file_name, table_name, "llamaindex")
         self._nodes = []
-
-    def create_tables(self):
-        ts_vector_store = TimescaleVectorStore.from_params(
+        self._ts_vector_store = TimescaleVectorStore.from_params(
             service_url=os.environ["TIMESCALE_SERVICE_URL"],
             table_name=self._table_name,
             time_partition_interval=self._time_delta,
         )
-        ts_vector_store._sync_client.drop_table()
-        ts_vector_store._sync_client.create_tables()
+        self._nodes=[]
+
+    def create_tables(self):
+        self._ts_vector_store._sync_client.drop_table()
+        self._ts_vector_store._sync_client.create_tables()
 
     # Create a Node object from a single row of data
     def create_node(self, row):
@@ -204,14 +198,6 @@ class LlamaIndex(ToolChain):
     
     def process(self, commit_count, skip_count):
         df = self.process_commit_range(commit_count, skip_count)
-        self._records = []
-        for _, row in df.iterrows():
-            record = self.process_row(row)
-            if record:
-                self._records.append(record)
-
-    def process(self, commit_count, skip_count):
-        df = self.process_commit_range(commit_count, skip_count)
         self._nodes = [self.create_node(row) for _, row in df.iterrows()]
         embedding_model = OpenAIEmbedding()
         embedding_model.api_key = os.environ['OPENAI_API_KEY']
@@ -220,6 +206,8 @@ class LlamaIndex(ToolChain):
         node.embedding = node_embedding
 
     def save(self):
+        if (len(self._nodes)) < 1:
+            return
         print(f"Inserting {len(self._nodes)} records")
         ts_vector_store = TimescaleVectorStore.from_params(
             service_url=os.environ["TIMESCALE_SERVICE_URL"],
@@ -229,9 +217,5 @@ class LlamaIndex(ToolChain):
         ts_vector_store.add(self._nodes)
 
     def create_index(self):
-        ts_vector_store = TimescaleVectorStore.from_params(
-            service_url=os.environ["TIMESCALE_SERVICE_URL"],
-            table_name=self._table_name,
-            time_partition_interval=self._time_delta,
-        )
-        ts_vector_store.create_index()
+        print("Creating Index")
+        self._ts_vector_store.create_index()
