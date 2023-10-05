@@ -9,7 +9,13 @@ setup(
     url='https://github.com/mahipv/githistoryloader',
     py_modules=['tsgitloader', 'toolchainutils'],
     install_requires=[
+        'GitPython',
+        'langchain',
+        'llama_index',
+        'pandas',
+        'psycopg2',
         'requests',
+        'timescale_vector'
     ],
     classifiers=[
         'Development Status :: 3 - Alpha',
